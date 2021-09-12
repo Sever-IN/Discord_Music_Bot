@@ -1,4 +1,4 @@
-#>>>python<<<
+#>._python_.<#
 import sys
 import re
 import json
@@ -7,15 +7,17 @@ from time import perf_counter, sleep
 import random
 from datetime import datetime, timedelta
 import threading
+import struct
 
-#>>>discord<<<
+#>._discord_.<#
 import discord
+from discord import player
 from discord.ext import commands, tasks
+from discord import NotFound, VoiceChannel
 
-#>>>others<<<
+#>._others_.<#
 from .vkontakte import Vkontakte, VkontakteAlbum, VkontakteTrack
 from .youtube import YouTube, YouTubeAlbum, YouTubeTrack
-
 
 
 class Player(threading.Thread):
@@ -25,23 +27,336 @@ class Player(threading.Thread):
         threading.Thread.__init__(self)
         self.daemon = True
 
-        self.source = None
         self.client = client
+        self.music = self.client.client.get_cog('Music')
+        self.session = self.music.sessions[self.client.guild.id]
+        
+        # self.client.encoder = opus.Encoder()
 
-        self._index = None
-        self._filters = {}
-        self.filters = {}
-        self.stamp = 0
-        self.s = None
-        self.e = None
+        self._source = None
 
-        self.items = []
-        self.queue = []
-        self.songs = []
+        self._index = 0
+        self._stand = 0
+        self._stamp = 0
+        self._of = 0
+        self._to = 0
+        self._mix = False
+        self._loop = False
 
-        self.mix = False
-        self.loop = False
+        self._items = list()
+        self._queue = list()
 
+        self._filters = dict()
+
+        self._state = threading.Event()
+        self._lock = threading.Lock()
+        self.status = False
+        self._stop = False
+    
+
+    def run(self):
+        self.loops = 0
+        self._start = perf_counter()
+
+        # getattr lookup speed ups
+        play_audio = self.client.send_audio_packet
+        self._speak(True)
+
+        while not self._stop:
+            # are we paused?
+            if not self._state.is_set() or self._source is None:
+                # wait until we aren't
+                self._state.wait()
+                continue
+            # are we disconnected from voice?
+            if not self.client._connected.is_set():
+                # wait until we are connected
+                self.client._connected.wait()
+                # reset our internal data
+                self.loops = 0
+                self._start = perf_counter()
+
+            self.loops += 1
+            data = self._source.read()
+            if not data:
+                music = self.client.client.get_cog('Music')
+                session = music.sessions[self.client.guild.id]
+                self.status = False
+                if self.loop:
+                    self.loops = 0
+                    self._stamp = 0
+                    self.play()
+                    asyncio.run_coroutine_threadsafe(music.i_update(session), self.client.client.loop)
+                else:
+                    # if self._index+1 < len(self._queue):
+                    self.index += 1
+                    self.loops = 0
+                    self._stamp = 0
+                    self._of = 0
+                    if self._index < len(self._queue):
+                        self.play()
+                        asyncio.run_coroutine_threadsafe(music.i_update(session), self.client.client.loop)
+                    else:
+                        self._state.clear()
+                        self._speak(False)
+                        asyncio.run_coroutine_threadsafe(music.i_update(session), self.client.client.loop)
+                        self._state.wait()
+            # print(data)
+
+            play_audio(data, encode=not self._source.is_opus())
+            next_time = self._start + self.DELAY * self.loops
+            delay = max(0, self.DELAY + (next_time - perf_counter()))
+            sleep(delay)
+
+    def after(self):
+        pass
+
+    def stop(self):
+        self._state.clear()
+        self._speak(False)
+        self._stop = True
+
+    def pause(self):
+        self._stamp += self.loops*self.DELAY
+        self.loops = 0
+        self._state.clear()
+        self._speak(False)
+
+    def resume(self):
+        self.loops = 0
+        self._start = perf_counter()
+        self._state.set()
+        self._speak(True)
+
+
+    def is_playing(self):
+        return self._state.is_set() and self.status
+
+    def is_paused(self):
+        return not self._state.is_set()
+
+    def _set_source(self, source):
+        with self._lock:
+            self.pause()
+            self.source = source
+            self.resume()
+
+    def _speak(self, speaking):
+        asyncio.run_coroutine_threadsafe(self.client.ws.speak(speaking), self.client.loop)
+
+    @property
+    def of(self):
+        return self._of
+    
+    @of.setter
+    def of(self, seconds: int):
+        self._of = seconds
+        self.play()
+
+    @property
+    def to(self):
+        return self._to
+    
+    @to.setter
+    def to(self, seconds: int):
+        self._to = seconds
+        self.play()
+
+    @property
+    def source(self):
+        return self._source
+    
+    @source.setter
+    def source(self):
+        pass
+
+    @property
+    def track(self):
+        if len(self._queue) > self._index:
+            item = self._items[self._queue[self._index][0]]
+            if isinstance(item, (VkontakteTrack, YouTubeTrack)):
+                return item
+
+            if isinstance(item, (VkontakteAlbum, YouTubeAlbum)):
+                return item.tracks[self._queue[self._index][1]]
+        return
+
+    @property
+    def index(self):
+        return self._index
+
+    @index.setter
+    def index(self, digit: int):
+        self._index = min(max(digit, 0), len(self._queue))
+        self._stand = max(self._index, self._stand)
+        self._of = 0
+        self._to = 0
+        self._stamp = 0
+        self.play()
+        asyncio.run_coroutine_threadsafe(self.music.q_update(self.session), self.client.client.loop)
+
+
+    @property
+    def timestamp(self):
+        # timestamp = self.loops*(self.DELAY*((self._filters.get('asetrate') or 48000)/48000))+self.stamp
+
+        return self.loops*self.DELAY+self._stamp+self._of
+
+    def play(self):
+        if self.track:
+            if self.track.url:
+                session = self.music.sessions[self.client.guild.id]
+                # if self.index is not None:
+                #     self._resumed.clear()
+
+                #     start = self.timestamp if self.s == None else max(self.timestamp, self.s)
+                #     end = self.track.duration if self.e == None else min(self.track.duration, self.e)
+
+                #     self._filters = self.filters
+
+                codec = self.track.codec
+                # codec = '' if self._filters else self.track.codec
+                if codec == 'opus':
+                    self._stamp = -(self._of%10)
+                # else:
+                #     self.stamp = start
+
+                source = discord.FFmpegOpusAudio(executable='windows/ffmpeg' if sys.platform == 'win32' else 'linux/ffmpeg',
+                    source=self.track.url,
+                    codec=codec,
+                    before_options=f'{"-http_persistent false " if codec == "m3u8" else ""}-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -ss {self._of+self._stamp+.1}',
+                    options='-vn'
+                    # options=f'-vn -filter:a {self.options}' if self._filters else '-vn'
+                )
+                self._source = source
+                self.loops = 0
+                self._start = perf_counter()
+                self._state.set()
+                self.status = True
+            else:
+                self._source = None
+        else:
+            self._source = None
+
+
+    # @property
+    # def options(self):
+    #     if self._filters:
+    #         l = []
+    #         for f, v in self._filters.items():
+    #             if isinstance(v, dict):
+    #                 items = list(v.items())
+    #                 l.append(':'.join([f'{f}={items[0][0]}={items[0][1]}']+[f'{i[0]}={i[1]}' for i in items[1:] if i[1] is not None]))
+    #             elif v is not None:
+    #                 l.append(f'{f}={v}')
+    #         return '"'+','.join(l)+'"'
+    #     else:
+    #         return ''
+
+
+
+    @property
+    def total(self):
+        duration = 0
+        for item in self._items:
+            if isinstance(item, (VkontakteTrack, YouTubeTrack)):
+                duration+=int(item.duration)
+            if isinstance(item, (VkontakteAlbum, YouTubeAlbum)):
+                duration+=sum([int(track.duration) for track in item.tracks])
+        return duration
+
+
+    @property
+    def loop(self):
+        return self._loop
+    
+    @loop.setter
+    def loop(self, arg: bool):
+        self.loop = arg
+
+    @property
+    def mix(self):
+        return self._mix
+    
+    @mix.setter
+    def mix(self, arg: bool):
+        if self._mix != arg:
+            self._mix = arg
+            if arg:
+                self._queue = self._queue[:self._stand+1]+random.sample(self._queue[self._stand+1:], len(self._queue[self._stand+1:]))
+            else:
+                self._queue = self._queue[:self._stand+1]+sorted(self._queue[self._stand+1:])
+            asyncio.run_coroutine_threadsafe(self.music.q_update(self.session), self.client.client.loop)
+
+
+    @property
+    def queue(self):
+        items = list()
+        for index in self._queue:
+            item = self._items[index[0]]
+            if isinstance(item, (VkontakteTrack, YouTubeTrack)):
+                items.append(item)
+
+            if isinstance(item, (VkontakteAlbum, YouTubeAlbum)):
+                items.append(item.tracks[index[1]])
+        return items
+
+    @queue.setter
+    def queue(self, items):
+        if not isinstance(items, (list, tuple)):
+            items = [items]
+        for item in items:
+            if isinstance(item, (VkontakteTrack, YouTubeTrack)):
+                self._items.append(item)
+                if self._mix:
+                    self._queue.insert(random.randint(self._index, len(self._queue)), (self._items.index(item), 0))
+                else:
+                    self._queue.append((self._items.index(item), 0))
+
+            if isinstance(item, (VkontakteAlbum, YouTubeAlbum)):
+                self._items.append(item)
+                if self._mix:
+                    [self._queue.insert(random.randint(self._index, len(self._queue)), (self._items.index(item), i)) for i in range(len(item.tracks))]
+                else:
+                    self._queue.extend([(self._items.index(item), i) for i in range(len(item.tracks))])
+        asyncio.run_coroutine_threadsafe(self.music.q_update(self.session), self.client.client.loop)
+
+
+
+class Music(commands.Cog):
+    def __init__(self, api):
+        self.api = api
+        self.vk = Vkontakte(path='data/tokens/vkontakte')
+        self.yt = YouTube(path='data/tokens/youtube')
+        self.sessions = dict()
+        self.commands = {
+            r'^(?:s!|\s*)?(?:j|join|войти)(?:\s+(?P<id>.+))?\s*$': self.connect,
+            r'^(?:s!|\s*)?(?:l|leave|выйти)\s*$': self.disconnect,
+
+            r'^(?:s!|\s*)?(?:h|help|помощь)\s*$': self.help,
+
+            r'^(?:s!|\s*)?(?:(?:(?:p|play|играть)\s+)?(?P<url>(?:https?://).+[^\s]?))|(?:p|play|играть)\s+(?P<name>.+)\s*$': self.play,
+            r'^(?:s!|\s*)?(?:[+]|resume|возобновить)\s*$': self.resume,
+            r'^(?:s!|\s*)?(?:[-]|pause|пауза)\s*$': self.pause,
+
+            r'^(?:s!|\s*)?(?:[=]|index|skip|пропустить)\s+(?P<count>[-]?\d+)\s*$': self.index,
+            r'^(?:s!|\s*)?(?P<next>[>]+)(?:\s+(?P<count>[-]?\d+))?\s*$': self.next,
+            r'^(?:s!|\s*)?(?P<back>[<]+)(?:\s+(?P<count>[-]?\d+))?\s*$': self.back,
+
+            # r'^(?:s!|\s*)?(?:r|re)\s*$': self.re,
+            r'^(?:s!|\s*)?(?:q|queue|очередь)\s*$': self.queue,
+            r'^(?:s!|\s*)?(?:s|search|искать|поиск)\s+(?P<search>.+)$': self.search,
+            r'^(?:s!|\s*)?(?:(?:choice|выбрать)\s+)?(?P<number>[-]?\d+)\s*$': self.choice,
+            r'^(?:s!|\s*)?(?::|set|поставить)\s+(?:(?:(?P<shour>\d+)[.:])?(?:(?P<sminute>\d+)[.:]))?(?P<ssecond>\d+)(?:\s+(?:(?:(?P<ehour>\d+)[.:])?(?:(?P<eminute>\d+)[.:]))?(?P<esecond>\d+))?\s*$': self.set,
+            
+            # r'^(?:s!|\s*)?(?:f|filter|фильтр)\s+(?P<filter>\w+)(?:\s+(?P<name>[_a-zA-Z]+))?(?:\s+(?P<value>[-]?(?:\d+(?:[.]\d*)?)|(?:\d*[.]\d+)))\s*$': self.filter,
+
+
+            # r'^(?:s!|\s*)?(?:n|nightcore|быстро)\s*$': self.nightcore,
+            # r'^(?:s!|\s*)?(?:v|vaporwave|slowed|медленно)\s*$': self.vaporwave,
+            # r'^(?:s!|\s*)?(?:d|default|обычно)\s*$': self.default,
+            # r'^(?:s!|\s*)?8[dD]\s*$': self.sd,
+        }
         self.language = 'gb'
         self.languages = {
             'ru': {
@@ -60,376 +375,176 @@ class Player(threading.Thread):
 
         self.interface = {}
         self.emojis = ['🔀', '⏪', '⏯️', '⏩', '🔁', '🌐']
-        self.embed = {"state": [":arrow_forward:", ":pause_button:"], "loop": [":repeat:", ":repeat_one:"], "mix": [":arrows_clockwise:", ":twisted_rightwards_arrows:"]}
+        self.embed = {"state": ['▶️', "⏸"], "loop": ["🔁", "🔂"], "mix": ["🔃", "🔀"]}
+        
+        self.auth.start()
         self.task.start()
-
-
-        self._end = threading.Event()
-        self._resumed = threading.Event()
-        self._current_error = None
-        self._connected = client._connected
-        self._lock = threading.Lock()
-
-    def run(self):
-        self.loops = 0
-        self._start = perf_counter()
-
-        # getattr lookup speed ups
-        play_audio = self.client.send_audio_packet
-        self._speak(True)
-
-        while not self._end.is_set():
-            # are we paused?
-            if not self._resumed.is_set():
-                # wait until we aren't
-                self._resumed.wait()
-                continue
-
-            # are we disconnected from voice?
-            if not self._connected.is_set():
-                # wait until we are connected
-                self._connected.wait()
-                # reset our internal data
-                self.loops = 0
-                self._start = perf_counter()
-
-            self.loops += 1
-            data = self.source.read()
-
-            if not data:
-                if self.loop:
-                    self.loops = 0
-                    self.stamp = 0
-                    self.play()
-                else:
-                    if self.songs:
-                        self.index = 1
-                        self.loops = 0
-                        self.stamp = 0
-                        self.s = 0
-                        self.play()
-                    else:
-                        self._resumed.clear()
-                        self._speak(False)
-                        self._resumed.wait()
-                asyncio.run_coroutine_threadsafe(self.update(), self.client.client.loop)
-
-
-            play_audio(data, encode=not self.source.is_opus())
-            next_time = self._start + self.DELAY * self.loops
-            delay = max(0, self.DELAY + (next_time - perf_counter()))
-            sleep(delay)
-
-    def after(self):
-        pass
-
-    def stop(self):
-        self._end.set()
-        self._resumed.set()
-        self._speak(False)
-        self.task.stop()
-        for m in self.interface.values():
-            asyncio.run_coroutine_threadsafe(m.delete(), self.client.client.loop)
-        self.interface.clear()
-
-    def pause(self, *, update_speaking=True):
-        self._resumed.clear()
-        if update_speaking:
-            self._speak(False)
-        self.stamp = self.timestamp
-
-    def resume(self, *, update_speaking=True):
-        self.loops = 0
-        self._start = perf_counter()
-        self._resumed.set()
-        if update_speaking:
-            self._speak(True)
-
-    def change(self):
-        if self.is_paused():
-            self.resume()
-        else:
-            self.pause()
-
-
-    def is_playing(self):
-        return self._resumed.is_set() and not self._end.is_set()
-
-    def is_paused(self):
-        return not self._end.is_set() and not self._resumed.is_set()
-
-    def _set_source(self, source):
-        with self._lock:
-            self.pause(update_speaking=False)
-            self.source = source
-            self.resume(update_speaking=False)
-
-    def _speak(self, speaking):
-        # try:
-        asyncio.run_coroutine_threadsafe(self.client.ws.speak(speaking), self.client.loop)
-        # except Exception as e:
-        #     log.info("Speaking call in player failed: %s", e)
-
-
-    @property
-    def timestamp(self):
-        # timestamp = self.loops*(self.DELAY*((self._filters.get('asetrate') or 48000)/48000))+self.stamp
-
-        return self.loops*(self.DELAY*((self._filters.get('asetrate') or 48000)/48000))+self.stamp
-
-    def play(self):
-        with self._lock:
-            if self.index is not None:
-                self._resumed.clear()
-
-                start = self.timestamp if self.s == None else max(self.timestamp, self.s)
-                end = self.track.duration if self.e == None else min(self.track.duration, self.e)
-
-                self._filters = self.filters
-
-                codec = '' if self._filters else self.track.codec
-                if codec == 'opus':
-                    self.stamp = start//10*10
-                else:
-                    self.stamp = start
-
-                source = discord.FFmpegOpusAudio(executable='lib/windows/ffmpeg' if sys.platform == 'win32' else 'lib/linux/ffmpeg',
-                    source=self.track.url,
-                    codec=codec,
-                    before_options=f'-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -ss {start} -to {end}',
-                    options=f'-vn -filter:a {self.options}' if self._filters else '-vn'
-                )
-                self.source = source
-                self.loops = 0
-                self._start = perf_counter()
-                self._resumed.set()
-
-
-    @property
-    def options(self):
-        if self._filters:
-            l = []
-            for f, v in self._filters.items():
-                if isinstance(v, dict):
-                    items = list(v.items())
-                    l.append(':'.join([f'{f}={items[0][0]}={items[0][1]}']+[f'{i[0]}={i[1]}' for i in items[1:] if i[1] is not None]))
-                elif v is not None:
-                    l.append(f'{f}={v}')
-            return '"'+','.join(l)+'"'
-        else:
-            return ''
-
-
-
-    @property
-    def track(self):
-        if isinstance(self.index, int):
-            return self.items[self.index]
-        elif isinstance(self.index, tuple):
-            return self.items[self.index[0]].tracks[self.index[1]]
-
-    @property
-    def total(self):
-        duration = 0
-        for item in self.items:
-            if isinstance(item, (VkontakteTrack, YouTubeTrack)):
-                duration+=int(item.duration)
-            if isinstance(item, (VkontakteAlbum, YouTubeAlbum)):
-                duration+=sum([int(track.duration) for track in item.tracks])
-        return duration
-
-    @property
-    def count(self):
-        count = len(self.queue) + len(self.songs)
-        if self.index is not None and self.index not in self.queue: count+=1
-        return count
-
-    @property
-    def index(self):
-        return self._index
-
-    @index.setter
-    def index(self, count: float):
-        index = self._index
-        if self._index is not None:
-            if self._index not in self.queue:
-                 self.queue.append(self._index)
-
-            if self._index in self.queue:
-                count -= len(self.queue)-self.queue.index(self._index)
-                if count >= 0:
-                    count += 1
-
-
-        number = min(max(-len(self.queue), count), len(self.songs))
-
-        if number < 0:
-            self._index = self.queue[number]
-
-        if number > 0:
-            if self.mix:
-                self._index = self.songs.pop(random.randrange(len(self.songs)))
-            else:
-                self._index = self.songs.pop(number-1)
-
-        self.stamp = 0
-        self.loops = 0
-        if self._index != index:
-            self.s = None
-            self.e = None
-        
-    def looping(self):
-        self.loop = not self.loop
-
-    def mixing(self):
-        self.mix = not self.mix
-
-    def add(self, item):
-        if isinstance(item, (VkontakteTrack, YouTubeTrack)):
-            self.items.append(item)
-            self.songs.append(self.items.index(item))
-            return True
-
-        if isinstance(item, (VkontakteAlbum, YouTubeAlbum)):
-            self.items.append(item)
-            self.songs.extend((self.items.index(item), i) for i in range(len(item.tracks)))
-            return True
-
-    async def update(self, message=False):
-        pos = len(self.queue) if self.index in self.queue else len(self.queue)+1
-        p = self.queue.index(self.index)+1 if self.index in self.queue else pos
-        
-        interface = self.languages[self.language]['interface']
-
-        description = f'`{interface[0]} :` **{p}**\n`{interface[1]} :` **{pos}**\n`{interface[2]} :` **{self.count}**\n`{interface[3]} :` **{len(self.items)}**\n`{interface[4]} :` **{timedelta(seconds=self.total)}**\n`{interface[5]} :` **{timedelta(seconds=int(self.client.timestamp/48000))}**\n:flag_{self.language}:'
-
-        music = discord.Embed(title=f"{self.track.title}", description=description, color=0x0369cf, timestamp=datetime.utcnow())
-        music.set_author(name=self.track.author, icon_url=self.track.main.urls['icon'])
-        music.set_footer(text=timedelta(seconds=self.track.duration))
-        music.set_thumbnail(url=self.track.cover)
-        a = self.embed["mix"][int(self.mix)]
-        b = self.embed["state"][int(self.is_playing())]
-        c = self.embed["loop"][int(self.loop)]
-        if not self.interface and message:
-            self.interface['player'] = await message.channel.send(content=f"{a}{b}{c}", embed=music)
-            self.interface['track'] = await message.channel.send(content=f"track")
-
-            for e in self.emojis:
-                if self.interface['player']:
-                    await self.interface['player'].add_reaction(e)
-        else:
-            await self.interface['player'].edit(content=f'{a}{b}{c}', embed=music)
-
-    def lang(self):
-        lang = list(self.languages.keys())
-        self.language = lang[lang.index(self.language)+1 if lang.index(self.language)+1 <= len(lang)-1 else 0]
-
-    async def reload(self, message):
-        self.task.stop()
-        for m in self.interface.values():
-            await m.delete()
-        self.interface.clear()
-        await self.update(message)
-        self.task.start()
-
-    async def buttons(self, payload):
-        
-        if payload.message_id == self.interface['player'].id:
-            if payload.emoji.name in self.emojis:
-                if payload.emoji.name == '🔀':
-                    self.mixing()
-                    await self.update()
-                if payload.emoji.name == '⏪':
-                    self.index = -1
-                    self.play()
-                    await self.update()
-                if payload.emoji.name == '⏯️':
-                    self.change()
-                    await self.update()
-                if payload.emoji.name == '⏩':
-                    self.index = 1
-                    self.play()
-                    await self.update()
-                if payload.emoji.name == '🔁':
-                    self.looping()
-                    await self.update()
-                if payload.emoji.name == '🌐':
-                    self.lang()
-                    await self.update()
-    
-    @tasks.loop(seconds=1)
-    async def task(self):
-        if self.is_playing():
-            total = self.track.duration
-            timestamp = '`'+'▬'*int(64*(self.timestamp/total))+'🔘'+'▬'*int(64-64*(self.timestamp/total))+'`'
-            track = discord.Embed(title=f'__{timedelta(seconds=int(self.timestamp))}__ / __{timedelta(seconds=total)}__', description=timestamp, color=0x0369cf)
-            
-            if 'track' in self.interface:
-                await self.interface['track'].edit(content='', embed=track)
-
-class Music(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        self.vk = Vkontakte(path='data/tokens/vkontakte.0')
-        self.yt = YouTube(path='data/tokens/youtube.0')
-        self.sessions = {}
-        self.users = {}
-        self.commands = {
-            r'^(?:s!|\s*)?(?:j|join|войти)\s*$': self.connect,
-            r'^(?:s!|\s*)?(?:l|leave|выйти)\s*$': self.disconnect,
-
-            r'^(?:s!|\s*)?(?:h|help|помощь)\s*$': self.help,
-
-            r'^(?:s!|\s*)?(?:(?:(?:p|play|играть)\s+)?(?P<url>(?:https?://).+[^\s]?))|(?:p|play|играть)\s+(?P<name>.+)\s*$': self.play,
-            r'^(?:s!|\s*)?(?:[+]|resume|возобновить)\s*$': self.resume,
-            r'^(?:s!|\s*)?(?:[-]|pause|пауза)\s*$': self.pause,
-
-            r'^(?:s!|\s*)?(?:[=]|index|skip|пропустить)\s+(?P<count>[-]?\d+)\s*$': self.index,
-            r'^(?:s!|\s*)?(?P<next>[>]+)(?:\s+(?P<count>[-]?\d+))?\s*$': self.next,
-            r'^(?:s!|\s*)?(?P<back>[<]+)(?:\s+(?P<count>[-]?\d+))?\s*$': self.back,
-
-            r'^(?:s!|\s*)?(?:r|re)\s*$': self.re,
-            r'^(?:s!|\s*)?(?:s|search|искать|поиск)\s+(?P<search>.+)$': self.search,
-            r'^(?:s!|\s*)?(?:(?:choice|выбрать)\s+)?(?P<number>[-]?\d+)\s*$': self.choice,
-            r'^(?:s!|\s*)?(?::|set|поставить)\s+(?:(?:(?P<shour>\d+)[.:])?(?:(?P<sminute>\d+)[.:]))?(?P<ssecond>\d+)(?:\s+(?:(?:(?P<ehour>\d+)[.:])?(?:(?P<eminute>\d+)[.:]))?(?P<esecond>\d+))?\s*$': self.set,
-            
-            r'^(?:s!|\s*)?(?:f|filter|фильтр)\s+(?P<filter>\w+)(?:\s+(?P<name>[_a-zA-Z]+))?(?:\s+(?P<value>[-]?(?:\d+(?:[.]\d*)?)|(?:\d*[.]\d+)))\s*$': self.filter,
-
-
-            r'^(?:s!|\s*)?(?:n|nightcore|быстро)\s*$': self.nightcore,
-            r'^(?:s!|\s*)?(?:v|vaporwave|slowed|медленно)\s*$': self.vaporwave,
-            r'^(?:s!|\s*)?(?:d|default|обычно)\s*$': self.default,
-            r'^(?:s!|\s*)?8[dD]\s*$': self.sd,
-        }
-        self.update.start()
 
     @tasks.loop(hours=24)
-    async def update(self):
+    async def auth(self):
         self.vk.auth(reboot=True)
 
-    async def connect(self, message):
-        if message.author.voice:
+    @tasks.loop(seconds=1)
+    async def task(self):
+        if self.sessions:
+            for id, session in self.sessions.items():
+                if 'client' in session:
+                    client = session['client']
+                    if client._player:
+                        if 'interface' in session:
+                            interface = session['interface']
+                            if client._player.is_playing() and 'output' in interface:
+                                await self.i_update(session)
+                        else:
+                            await self.i_update(session)
+    
+    def i_args(self, session: dict):
+        
+        args = dict()
+
+        if 'interface' not in session:
+            session['interface'] = dict()
+        interface = session['interface']
+        player = session['client']._player
+            
+        if 'r' not in interface:
+            interface['r'] = random.randint(0, 128)
+        else:
+            interface['r'] = min(interface['r']+random.randint(0, 16), 255) if interface['r'] < 255 else random.randint(0, 128)
+
+        if 'g' not in interface:
+            interface['g'] = random.randint(0, 128)
+        else:
+            interface['g'] = min(interface['g']+random.randint(0, 16), 255) if interface['g'] < 255 else random.randint(0, 128)
+
+        if 'b' not in interface:
+            interface['b'] = random.randint(0, 128)
+        else:
+            interface['b'] = min(interface['b']+random.randint(0, 16), 255) if interface['b'] < 255 else random.randint(0, 128)
+
+
+        language = self.languages[self.language]['interface']
+        if player:
+            description = f'`{language[0]} :` **{player._index if player.track else 0}**\n`{language[1]} :` **{player._stand if player.track else 0}**\n`{language[2]} :` **{len(player._queue)}**\n`{language[3]} :` **{len(player._items)}**\n`{language[4]} :` **{timedelta(seconds=player.total)}**\n`{language[5]} :` **{timedelta(seconds=int(player.client.timestamp/48000))}**\n:flag_{self.language}:'
+        
+            a = self.embed["mix"][int(player._mix)]
+            b = self.embed["state"][int(player.is_playing())]
+            c = self.embed["loop"][int(player._loop)]
+
+            content = f'{a}{b}{c}'
+
+            embed = discord.Embed(title=f'{player.track.title if player.track else "None"}', description=description, color=int('%02x%02x%02x' % (interface['r'], interface['g'], interface['b']), 16), timestamp=datetime.utcnow())
+
+            if player.track:
+                if player.track.duration:
+                    timestamp = '`'+'▬'*int(24*(player.timestamp/player.track.duration))+'🔘'+'▬'*int(24-24*(player.timestamp/player.track.duration))+'`'
+                    embed.add_field(name=f'__{timedelta(seconds=int(player.timestamp))}__ / __{timedelta(seconds=player.track.duration-int(player.timestamp))}__', value=timestamp, inline=False)
+                else:
+                    timestamp = '`'+'▬'*48+'🔘`'
+                    embed.add_field(name=f'__{timedelta(seconds=int((datetime.now()-player.track.start).total_seconds()-10800))}__ / __{timedelta(seconds=0)}__', value=timestamp, inline=False)
+            else:
+                timestamp = '`'+'▬'*48+'🔘`'
+                embed.add_field(name=f'__{timedelta(seconds=0)}__ / __{timedelta(seconds=0)}__', value=timestamp, inline=False)
+
+
+            if player.track:
+                embed.set_author(name=f'{player.track.author if player.track else "None"}', icon_url=player.track.main.urls['icon'] if player.track else None)
+                embed.set_footer(text=timedelta(seconds=player.track.duration if player.track else 0))
+                embed.set_thumbnail(url=player.track.cover)
+        else:
+            content = 'None'
+            embed = None
+        args['content'] = content
+        args['embed'] = embed
+        return args
+    
+    async def i_update(self, session):
+        if 'interface' not in session:
+            session['interface'] = dict()
+        interface = session['interface']
+
+        args = self.i_args(session)
+
+        if 'output' in interface:
+            try:
+                await interface['output'].edit(content=args['content'], embed=args['embed'])
+            except NotFound:
+                pass
+
+        else:
+            try:
+                interface['output'] = await session['channel'].send(content=args['content'], embed=args['embed'])
+                for emoji in self.emojis:
+                    await interface['output'].add_reaction(emoji)
+            except NotFound:
+                pass
+
+    async def connect(self, message, channel=None):
+
+        if message.author.voice or channel:
             if message.guild.id not in self.sessions:
-                await message.delete()
+                self.sessions[message.guild.id] = dict({'guild': message.guild})
+            session = self.sessions[message.guild.id]
 
-                session = await message.author.voice.channel.connect()
-                self.sessions[message.guild.id] = session
-
-                session._player = Player(session)
-                session._player.start()
+            if 'client' not in session:
+                if channel is not None:
+                    if isinstance(channel, VoiceChannel):
+                        session['client'] = await channel.connect()
+                    else:
+                        try:
+                            int(channel)
+                        except ValueError:
+                            return 'id канала должен состоять из цифр!'
+                        voice = session['guild'].get_channel(int(channel))
+                        if voice:
+                            session['client'] = await voice.connect()
+                        else:
+                            return 'канал не найден!'
+                else:
+                    session['client'] = await message.author.voice.channel.connect()
+                client = session['client']
+                client._player = Player(client)
+                client._player.start()
+                session['channel'] = message.channel
+                return True
+            else:
+                client = session['client']
+                if channel is not None:
+                    if isinstance(channel, VoiceChannel):
+                        await client.move_to(channel)
+                    else:
+                        try:
+                            int(channel)
+                        except ValueError:
+                            return 'id канала должен состоять из цифр!'
+                        voice = session['guild'].get_channel(int(channel))
+                        if voice:
+                            await client.move_to(voice)
+                            return True
+                        else:
+                            return 'канал не найден!'
+                else:
+                    return 'бот уже подкючен!'
+        else:
+            return 'вас нет в голосовом канале!'
                 
     async def disconnect(self, message):
         if message.guild.id in self.sessions:
-            await message.delete()
-
-            session = self.sessions.pop(message.guild.id)
-            # session._player.task.stop()
-            # for m in session._player.interface.values():
-            #     await m.delete()
-            # session._player.interface.clear()
-            session._player.stop()
-            await session.disconnect()
-            del session
+            session = self.sessions[message.guild.id]
+            if 'client' in session:
+                client = session.pop('client')
+                player = client._player
+                if player:
+                    player.stop()
+                await client.disconnect(force=True)
+                if 'interface' in session:
+                    interface = session.pop('interface')
+                    await interface['output'].delete()
+                return True
+            else:
+                return 'бот не подключен!'
+        else:
+            return 'сессия не создана!'
         
     async def play(self, message, url: str, name: str):
         if message.author.voice:
@@ -440,337 +555,522 @@ class Music(commands.Cog):
                 if yts:
                     item = yts[0]
                 else:
-                    vks = self.yt.search(name, {'album': 0, 'track': 1})['tracks']
+                    vks = self.vk.search(name, {'album': 0, 'track': 1})['tracks']
                     if vks:
                         item = vks[0]
+                    else:
+                        item = None
             if item:
-                await message.delete()
-
                 if message.guild.id not in self.sessions:
-                    session = await message.author.voice.channel.connect()
-                    self.sessions[message.guild.id] = session
-                    session._player = Player(session)
-                    session._player.start()
-                else:
-                    session = self.sessions[message.guild.id]
-                
-                session._player.add(item)
-                if session._player.source is None:
-                    session._player.index = 1
-                    session._player.play()
-                
-                await session._player.update(message)
+                    self.sessions[message.guild.id] = dict({'guild': message.guild})
+                session = self.sessions[message.guild.id]
+                if 'client' not in session:
+                    await self.connect(message=message)
+                session['client']._player.queue = item
+
+                if not session['client']._player.status:
+                    session['client']._player.play()
+                return True
+            else:
+                return 'ничего не найдено!'
 
     async def pause(self, message):
         if message.author.voice:
             if message.guild.id in self.sessions:
-                await message.delete()
-
                 session = self.sessions[message.guild.id]
-                session._player.pause()
-                await session._player.update()
+                if 'client' in session:
+                    client = session['client']
+                    player = client._player
+                    player.pause()
+                    await self.i_update(session)
+                    return True
+                return 'бот не подключен!'
+            return 'сессия не создана!'
+        return 'вас нет в голосовом канале!'
         
     async def resume(self, message):
         if message.author.voice:
             if message.guild.id in self.sessions:
-                await message.delete()
-
                 session = self.sessions[message.guild.id]
-                session._player.resume()
-                await session._player.update()
+                if 'client' in session:
+                    client = session['client']
+                    player = client._player
+                    player.resume()
+                    await self.i_update(session)
+                    return True
+                return 'бот не подключен!'
+            return 'сессия не создана!'
+        return 'вас нет в голосовом канале!'
         
     async def index(self, message, count: int):
         if message.author.voice:
             if message.guild.id in self.sessions:
-                await message.delete()
-
-                count = int(count)
                 session = self.sessions[message.guild.id]
-                if count > 0:
-                    for _ in range(count):
-                        session._player.index = 1
-                if count < 0:
-                    session._player.index = count
-                session._player.s = 0
-                session._player.play()
-                await session._player.update()
+                if 'client' in session:
+                    client = session['client']
+                    player = client._player
+                    player.index = int(count)
+                    await self.i_update(session)
+                    return True
+                return 'бот не подключен!'
+            return 'сессия не создана!'
+        return 'вас нет в голосовом канале!'
 
     async def next(self, message, command: str, count: int):
         if message.author.voice:
             if message.guild.id in self.sessions:
-                await message.delete()
-
-                count = abs(len(command)*(int(count) if count else 1))
                 session = self.sessions[message.guild.id]
-                for _ in range(count):
-                    session._player.index = 1
-                session._player.s = 0
-                session._player.play()
-                await session._player.update()
+                if 'client' in session:
+                    client = session['client']
+                    player = client._player
+                    player.index += abs(len(command)*(int(count) if count else 1))
+                    await self.i_update(session)
+                    return True
+                return 'бот не подключен!'
+            return 'сессия не создана!'
+        return 'вас нет в голосовом канале!'
 
 
     async def back(self, message, command: str, count: int):
         if message.author.voice:
             if message.guild.id in self.sessions:
-                await message.delete()
-
-                count = -abs(len(command)*(int(count) if count else -1))
                 session = self.sessions[message.guild.id]
-                session._player.index = count
-                session._player.s = 0
-                session._player.play()
-                await session._player.update()
+                if 'client' in session:
+                    client = session['client']
+                    player = client._player
+                    player.index -= abs(len(command)*(int(count) if count else 1))
+                    await self.i_update(session)
+                    return True
+                return 'бот не подключен!'
+            return 'сессия не создана!'
+        return 'вас нет в голосовом канале!'
 
+    def q_args(self, member):
+        args = dict()
+        if member.guild.id in self.sessions:
+            session = self.sessions[member.guild.id]
+            if 'client' in session:
+                client = session['client']
+                player = client._player
+                if 'users' in session:
+                    if member.id in session['users']:
+                        user = session['users'][member.id]
+                        queue = user['queue']
+
+
+                        embed = discord.Embed(title=f'Page: `{queue["page"]}/{len(player._queue)//9}`', description='', color=0x69cf03, timestamp=datetime.utcnow())
+                        page = player.queue[queue['page']*9:queue['page']*9+9]
+                        for index in range(len(page)):
+                            item = page[index]
+                            embed.add_field(name=f'`{queue["page"]*9+index}`'+item.author, value='**`'+item.title+'`**' if player._index == queue['page']*9+index else item.title)
+
+                        args['embed'] = embed
+                        return args
+    
+    async def q_update(self, session):
+
+        if 'users' in session:
+            users = session['users']
+            for id, user in users.items():
+                if 'queue' in user:
+                    queue = user['queue']
+                    if 'guild' in session:
+                        guild = session['guild']
+                        member = guild.get_member(id)
+                        args = self.q_args(member)
+
+                        if 'output' in queue:
+                            try:
+                                await queue['output'].edit(embed=args['embed'])
+                            except NotFound:
+                                pass
+                        else:
+                            if 'input' in queue:
+                                try:
+                                    queue['output'] = await queue['input'].channel.send(embed=args['embed'])
+                                    await queue['output'].add_reaction('⬅️')
+                                    await queue['output'].add_reaction('➡️')
+                                    await queue['output'].add_reaction('⏹️')
+                                except NotFound:
+                                    pass
+
+    async def queue(self, message):
+        if message.guild.id in self.sessions:
+            session = self.sessions[message.guild.id]
+
+            if 'client' in session:
+                client = session['client']
+                player = client._player
+
+                if 'users' not in session:
+                    session['users'] = dict()
+                users = session['users']
+
+                if message.author.id not in users:
+                    users[message.author.id] = dict()
+                user = users[message.author.id]
+
+                if 'queue' not in user:
+                    user['queue'] = dict()
+                queue = user['queue']
+
+                if 'output' in queue:
+                    await queue['output'].delete()
+                    del queue['output']
+
+                queue['page'] = int(player.index//9)
+                queue['input'] = message
+                await self.q_update(session)
+
+                return True
+            else:
+                return 'бот не подключен!'
+        else:
+            return 'сессия не создана!'
+
+    def s_args(self, member):
+        args = dict()
+        session = self.sessions[member.guild.id]
+        user = session['users'][member.id]
+        search = user['search']
+        vks = search['vkontakte']
+        yts = search['youtube']
+
+        embed = discord.Embed(title=f'🔎 __**`{search["string"]}`**__', description='')
+        if vks['albums']:
+            embed.add_field(
+                name=f'`Type`**:** __**VkontakteAlbum**__',
+                value='\n'.join([('**'+str(i)+'**' if i in search['choice'] else str(i))+f'. [{vks["albums"][i].title}](https://vk.com/music/album/{vks["albums"][i].owner}_{vks["albums"][i].album}_{vks["albums"][i].access}) | `{timedelta(seconds=vks["albums"][i].duration)}`' for i in range(len(vks["albums"]))]),
+                inline=False
+            )
+        if vks['tracks']:
+            embed.add_field(
+                name=f'`Type`**:** __**VkontakteTrack**__',
+                value='\n'.join([('**'+str(i+len(vks["albums"]))+'**' if i+len(vks["albums"]) in search['choice'] else str(i+len(vks["albums"])))+f'. [{vks["tracks"][i].title}]({vks["tracks"][i].url.split("m3u8")[0]}m3u8) | `{timedelta(seconds=vks["tracks"][i].duration)}`' for i in range(len(vks["tracks"]))]),
+                inline=False
+            )
+        if yts['albums']:
+            embed.add_field(
+                name=f'`Type`**:** __**YouTubeAlbum**__',
+                value='\n'.join([('**'+str(i+len(vks["albums"])+len(vks["tracks"]))+'**' if i+len(vks["albums"])+len(vks["tracks"]) in search['choice'] else str(i+len(vks["albums"])+len(vks["tracks"])))+f'. [{yts["albums"][i].title}](https://www.youtube.com/playlist={yts["albums"][i].id}) | `{timedelta(seconds=yts["albums"][i].duration)}`' for i in range(len(yts["albums"]))]),
+                inline=False
+            )
+        if yts['tracks']:
+            embed.add_field(
+                name=f'`Type`**:** __**YouTubeTrack**__',
+                value='\n'.join([('**'+str(i+len(vks["albums"])+len(vks["tracks"])+len(yts["albums"]))+'**' if i+len(vks["albums"])+len(vks["tracks"])+len(yts["albums"]) in search['choice'] else str(i+len(vks["albums"])+len(vks["tracks"])+len(yts["albums"])))+f'. [{yts["tracks"][i].title}](https://www.youtube.com/watch?v={yts["tracks"][i].id}) | `{timedelta(seconds=yts["tracks"][i].duration)}`' for i in range(len(yts["tracks"]))]),
+                inline=False
+            )
+        embed.set_author(name=member.name, icon_url=member.avatar_url)
+        embed.set_footer(text='Time: {:.3}'.format(search['time']), icon_url=self.api.user.avatar_url)
+        args['embed'] = embed
+        return args
+    
+    async def s_update(self, member):
+        if member.guild.id in self.sessions:
+            session = self.sessions[member.guild.id]
+            if 'users' in session:
+                users = session['users']
+                if member.id in users:
+                    user = users[member.id]
+                    if 'search' in user:
+                        search = user['search']
+                        args = self.s_args(member)
+                        if 'output' in search:
+                            try:
+                                await search['output'].edit(embed=args['embed'])
+                            except NotFound:
+                                pass
+                        else:
+                            if 'input' in search:
+                                try:
+                                    search['output'] = await search['input'].channel.send(embed=args['embed'])
+                                    await search['output'].add_reaction('⏹️')
+                                except NotFound:
+                                    pass
 
     async def search(self, message, string: str):
-        if message.author.voice:
-            await message.delete()
 
-            if message.author.id in self.users:
-                user = self.users[message.author.id]
-                if 'search' in user:
-                    await user['search']['message'].delete()
-                    del user['search']
-                    # print(self.users)
-            else:
-                self.users[message.author.id] = {}
-                self.users[message.author.id]['search'] = {}
-            t = perf_counter()
-            vks = self.vk.search(string, {'album': 1, 'track': 5})
-            yts = self.yt.search(string, {'album': 1, 'track': 5})
+        if message.guild.id not in self.sessions:
+            self.sessions[message.guild.id] = dict({'guild': message.guild})
+        session = self.sessions[message.guild.id]
 
-            embed = discord.Embed(title=f'🔎 __**`{string}`**__', description='')
-            if vks['albums']:
-                embed.add_field(
-                    name=f'`Type`**:** __**VkontakteAlbum**__',
-                    value='\n'.join([f'{i+1}. [{vks["albums"][i].title}](https://vk.com/music/album/{vks["albums"][i].owner}_{vks["albums"][i].album}_{vks["albums"][i].access}) | `{timedelta(seconds=vks["albums"][i].duration)}`' for i in range(len(vks["albums"]))]),
-                    inline=False
-                )
-            if vks['tracks']:
-                embed.add_field(
-                    name=f'`Type`**:** __**VkontakteTrack**__',
-                    value='\n'.join([f'{i+1+len(vks["albums"])}. [{vks["tracks"][i].title}]({vks["tracks"][i].url.split("mp3")[0]}mp3) | `{timedelta(seconds=vks["tracks"][i].duration)}`' for i in range(len(vks["tracks"]))]),
-                    inline=False
-                )
-            if yts['albums']:
-                embed.add_field(
-                    name=f'`Type`**:** __**YouTubeAlbum**__',
-                    value='\n'.join([f'{i+1+len(vks["albums"])+len(vks["tracks"])}. [{yts["albums"][i].title}](https://www.youtube.com/playlist={yts["albums"][i].id}) | `{timedelta(seconds=yts["albums"][i].duration)}`' for i in range(len(yts["albums"]))]),
-                    inline=False
-                )
-            if yts['tracks']:
-                embed.add_field(
-                    name=f'`Type`**:** __**YouTubeTrack**__',
-                    value='\n'.join([f'{i+1+len(vks["albums"])+len(vks["tracks"])+len(yts["albums"])}. [{yts["tracks"][i].title}](https://www.youtube.com/watch?v={yts["tracks"][i].id}) | `{timedelta(seconds=yts["tracks"][i].duration)}`' for i in range(len(yts["tracks"]))]),
-                    inline=False
-                )
+        if 'users' not in session:
+            session['users'] = dict()
+        if message.author.id not in session['users']:
+            session['users'][message.author.id] = dict()
+        user = session['users'][message.author.id]
 
-            embed.set_author(name=message.author, icon_url=message.author.avatar_url)
-            embed.set_footer(text='Time: {:.3}'.format(perf_counter()-t), icon_url=self.bot.user.avatar_url)
+        if 'search' in user:
+            await user['search']['output'].delete()
+        else:
+            user['search'] = dict()
 
-            search = await message.channel.send(embed=embed)
-            await search.add_reaction('⏹️')
-
-            self.users[message.author.id]['search'] = {'message': search, 'vkontakte': vks, 'youtube': yts}
+        search = user['search']
+        
+        search['input'] = message
+        search['string'] = string
+        time = perf_counter()
+        search['youtube'] = self.yt.search(string, {'album': 1, 'track': 4})
+        search['vkontakte'] = self.vk.search(string, {'album': 1, 'track': 4})
+        search['time'] = perf_counter()-time
+        search['choice'] = list()
+        await self.s_update(message.author)
+        return True
 
     async def choice(self, message, number: int):
-        if message.author.voice:
-            user = self.users.get(message.author.id)
-            if user:
-                search = user.get('search')
-                if search:
-                    if search['message'].channel.id == message.channel.id:
-                        await message.delete()
-                        await search['message'].delete()
-
-                        items = search['vkontakte']['albums']+search['vkontakte']['tracks']+search['youtube']['albums']+search['youtube']['tracks']
-                        number = min(max(int(number), 1), len(items))
-                        item = items[number-1]
-                        del user['search']
-
-                        if message.guild.id not in self.sessions:
-                            session = await message.author.voice.channel.connect()
-                            self.sessions[message.guild.id] = session
-                            session._player = Player(session)
-                            session._player.start()
+        if message.guild.id not in self.sessions:
+            self.sessions[message.guild.id] = dict({'guild': message.guild})
+        session = self.sessions[message.guild.id]
+        if 'users' in session:
+            users = session['users']
+            if message.author.id in users:
+                user = users[message.author.id]
+                if 'search' in user:
+                    search = user['search']
+                    for digit in number:
+                        choice = min(max(int(digit), 0), search['vkontakte']['count']+search['youtube']['count']-1)
+                        if choice in search['choice']:
+                            search['choice'].remove(choice)
                         else:
-                            session = self.sessions[message.guild.id]
+                            search['choice'].append(choice)
+                    await self.s_update(message.author)
+                if 'client' in session:
+                    client = session['client']
+                    player = client._player
+                    if 'queue' in user:
+                        queue = user['queue']
+                        queue['page'] = max(min(int(number), len(player._queue)//9), 0)
+                        await self.q_update(session)
+                return True
 
-                        session._player.add(item)
-                        if session._player.source is None:
-                            session._player.index = 1
-                            session._player.play()
-                        await session._player.update(message)
-
-    async def set(self, message, shour:int, sminute:int, ssecond:int, ehour:int, eminute:int, esecond:int):
+    async def set(self, message, fhour:int, fminute:int, fsecond:int, thour:int, tminute:int, tsecond:int):
         if message.author.voice:
             if message.guild.id in self.sessions:
-                await message.delete()
-
                 session = self.sessions[message.guild.id]
+                if 'client' in session:
+                    client = session['client']
+                    player = client._player
 
-                start = 0
-                end = 0
+                    of = 0
+                    to = 0
 
-                if ssecond:
-                    start+=int(ssecond)
-                if sminute:
-                    start+=60*int(sminute)
-                if shour:
-                    start+=3600*int(shour)
+                    if fsecond:
+                        of+=int(fsecond)
+                    if fminute:
+                        of+=60*int(fminute)
+                    if fhour:
+                        of+=3600*int(fhour)
 
-                if esecond:
-                    end+=int(esecond)
-                if eminute:
-                    end+=60*int(eminute)
-                if ehour:
-                    end+=3600*int(ehour)
+                    if tsecond:
+                        to+=int(tsecond)
+                    if tminute:
+                        to+=60*int(tminute)
+                    if thour:
+                        to+=3600*int(thour)
 
-                if start >= end and end != 0:
-                    end = start+end
-
-                session._player.s = start if start else None
-                session._player.e = end if end else None
-                session._player.stamp = 0
-                session._player.loops = 0
-                session._player.play()
-                await session._player.update(message)
-
-    async def filter(self, message, f, n, v):
-        if message.author.voice:
-            if message.guild.id in self.sessions:
-                await message.delete()
-
-                v = float(v)
-
-                session = self.sessions[message.guild.id]
-                session._player.filters.update({f: {n: v} if n and v else n if n else v if v else None})
-                session._player.play()
-                await session._player.update(message)
-
-    async def nightcore(self, message):
-        if message.author.voice:
-            if message.guild.id in self.sessions:
-                await message.delete()
-
-                session = self.sessions[message.guild.id]
-                session._player.filters.update({'asetrate': 48000*(10/9)})
-                session._player.play()
-                await session._player.update(message)
-
-    async def vaporwave(self, message):
-        if message.author.voice:
-            if message.guild.id in self.sessions:
-                await message.delete()
-
-                session = self.sessions[message.guild.id]
-                session._player.filters.update({'asetrate': 48000*(9/10)})
-                session._player.play()
-                await session._player.update(message)
-
-    async def sd(self, message):
-        if message.author.voice:
-            if message.guild.id in self.sessions:
-                await message.delete()
-
-                session = self.sessions[message.guild.id]
-                session._player.filters.update({'apulsator': {'hz': 0.08}})
-                session._player.play()
-                await session._player.update(message)        
-
-    async def default(self, message):
-        if message.author.voice:
-            if message.guild.id in self.sessions:
-                await message.delete()
-
-                session = self.sessions[message.guild.id]
-                session._player.filters.clear()
-                session._player.play()
-                await session._player.update(message)
-    
-    async def re(self, message):
-        if message.author.voice:
-            if message.guild.id in self.sessions:
-                await message.delete()
-
-                session = self.sessions[message.guild.id]
-                await session._player.reload(message)
+                    player._of = min(of, player.track.duration)
+                    player._to = min(to, player.track.duration)
+                    # player._stamp = 0
+                    # player.loops = 0
+                    player.play()
+                    await self.i_update(session)
+                    return True
+                # else:
+                #     return 'точка начала должна быть меньше чем точка конца'
+                else:
+                    return 'бот не подключен!'
+            else:
+                return 'сессия не создана!'
+        return 'вас нет в голосовом канале!'
     
     async def help(self, message):
         if message.author.voice:
-            await message.delete()
-
-            if message.author.id in self.users:
-                user = self.users[message.author.id]
-                if 'help' in user:
-                    await user['help']['message'].delete()
-                    del user['help']
-            else:
-                self.users[message.author.id] = {}
-                self.users[message.author.id]['help'] = {}
+            if message.guild.id not in self.sessions:
+                self.sessions[message.guild.id] = dict({'guild': message.guild})
+            session = self.sessions[message.guild.id]
+            if 'users' not in session:
+                session['users'] = dict()
+            users = session['users']
 
             content = open('help.txt', 'r', encoding='utf-8').read()
-            help = await message.channel.send(content=content)
-            await help.add_reaction('⏹️')
-            self.users[message.author.id]['help'] = {'message': help}
+            output = await message.channel.send(content=content)
+            try:
+                await output.add_reaction('⏹️')
+            except NotFound:
+                pass
+
+            if message.author.id not in users:
+                users[message.author.id] = dict()
+            user = users[message.author.id]
+            if 'help' not in user:
+                user['help'] = dict()
+            help = user['help']
+            if 'output' in help:
+                try:
+                    await help['output'].delete()
+                except NotFound:
+                    pass
+
+            help['output'] = output
+            return True
 
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
-        if member.id == self.bot.user.id:
+        if member.id == self.api.user.id:
             if before.channel is not None:
                 if before.channel.guild.id in self.sessions:
-                    if after.channel == None:
+                    session = self.sessions[before.channel.guild.id]
+                    if 'client' in session:
+                        client = session['client']
+                        player = client._player
+                        if after.channel == None:
+                            if player:
+                                player.stop()
+                            await client.disconnect(force=True)
+                            del session['client']
+                            if 'interface' in session:
+                                await session['interface']['output'].delete()
+                                del session['interface']
+                        else:
+                            player._stamp += player.loops*player.DELAY
+                            self.loops = 0
+                            # self._start = perf_counter()
 
-                        session = self.sessions.pop(before.channel.guild.id)
-                        if session._player:
-                            session._player.stop()
-                        await session.disconnect(force=True)
-                        del session
+    # @commands.Cog.listener()
+    # async def on_voice_server_update(self, data):
+    #     print(data)
 
-    @commands.Cog.listener()
-    async def on_voice_server_update(self, data):
-        print(data)
-
-    @commands.Cog.listener()
-    async def on_ready(self):
-        pass
+    # @commands.Cog.listener()
+    # async def on_ready(self):
+    #     pass
 
     @commands.Cog.listener()
     async def on_message(self, message):
         if not message.author.bot:
-            for line in str(message.content).split():
+            status = []
+            for line in str(message.content).split('\n'):
                 for r in self.commands:
                     command = re.match(r, line)
                     if command:
-                        await self.commands[r](message, *command.groups())
+                        state = await self.commands[r](message, *command.groups())
+                        if state is True:
+                            status.append(True)
+                        else:
+                            status.append(False)
+                            if isinstance(state, str):
+                                await message.channel.send(state)
                         break
+            if any(status):
+                await message.delete(delay=.1)
+
+    @commands.Cog.listener()
+    async def on_message_delete(self, message):
+        if message.guild.id in self.sessions:
+            session = self.sessions[message.guild.id]
+            if 'interface' in session:
+                interface = session['interface']
+                if 'output' in interface:
+                    if message.id == interface['output'].id:
+                        if 'client' in session:
+                            del interface['output']
+                            await self.i_update(session)
+
+    def lang(self):
+        lang = list(self.languages.keys())
+        self.language = lang[lang.index(self.language)+1 if lang.index(self.language)+1 <= len(lang)-1 else 0]
+
+    async def payload(self, payload):
+        if payload.user_id != self.api.user.id:
+            if payload.guild_id not in self.sessions:
+                self.sessions[payload.guild_id] = dict({'guild': self.api.get_guild(payload.guild_id)})
+            session = self.sessions[payload.guild_id]
             
+            if 'interface' in session:
+                interface = session['interface']
+                if 'output' in interface:
+                    if payload.message_id == interface['output'].id:
+                        if 'client' in session:
+                            client = session['client']
+                            player = client._player
+                            if payload.emoji.name == '🔀':
+                                player.mix = not player._mix
+                            if payload.emoji.name == '⏪':
+                                player.index -= 1
+                            if payload.emoji.name == '⏯️':
+                                player.pause() if player._state.is_set() else player.resume()
+                            if payload.emoji.name == '⏩':
+                                player.index += 1
+                            if payload.emoji.name == '🔁':
+                                player._loop = not player._loop
+                            if payload.emoji.name == '🌐':
+                                self.lang()
+                            await self.i_update(session)
+
+            if 'users' in session:
+                if payload.user_id in session['users']:
+                    user = session['users'][payload.user_id]
+                    
+                    if 'help' in user:
+                        help = user['help']
+                        if 'output' in help:
+                            if payload.message_id == help['output'].id:
+                                if payload.emoji.name == '⏹️':
+                                    await user['help']['output'].delete()
+                                    del user['help']
+
+                    if 'search' in user:
+                        search = user['search']
+                        if 'output' in search:
+                            if payload.message_id == search['output'].id:
+                                if payload.emoji.name == '⏹️':
+                                    items = search['vkontakte']['albums']+search['vkontakte']['tracks']+search['youtube']['albums']+search['youtube']['tracks']
+                                    item = [items[i] for i in search['choice']]
+
+                                    if item:
+                                        if 'client' not in session:
+                                            await self.connect(search['output'], payload.member.voice.channel)
+                                        client = session['client']
+                                        player = client._player
+
+                                        player.queue = item
+
+                                        if not player.status:
+                                            player.play()
+                                        await self.i_update(session)
+                                    await search['output'].delete()
+                                    del user['search']
+
+                    if 'queue' in user:
+                        queue = user['queue']
+                        if 'output' in queue:
+                            if payload.message_id == queue['output'].id:
+                                if 'client' in session:
+                                    client = session['client']
+                                    player = client._player
+
+                                    if payload.emoji.name == '⬅️':
+                                        queue['page'] = max(queue['page']-1, 0)
+                                        await self.q_update(session)
+
+                                    if payload.emoji.name == '➡️':
+                                        queue['page'] = min(queue['page']+1, len(player._queue)//9)
+                                        await self.q_update(session)
+
+                                if payload.emoji.name == '⏹️':
+                                    await queue['output'].delete()
+                                    del user['queue']
+
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload):
-        if payload.user_id != self.bot.user.id:
-            if payload.user_id in self.users:
-                if payload.emoji.name == '⏹️':
-                    user = self.users[payload.user_id]
-                    if 'search' in user:
-                        if payload.message_id == user['search']['message'].id:
-                            await user['search']['message'].delete()
-                            del user['search']
-                    if 'help' in user:
-                        if payload.message_id == user['help']['message'].id:
-                            await user['help']['message'].delete()
-                            del user['help']
-
-            session = self.sessions.get(payload.guild_id)
-            if session:
-                await session._player.buttons(payload)
+        await self.payload(payload)
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload):
-        if payload.user_id != self.bot.user.id:
-            session = self.sessions.get(payload.guild_id)
-            if session:
-                await session._player.buttons(payload)
+        guild = self.api.get_guild(payload.guild_id)
+        payload.member = guild.get_member(payload.user_id)
+        await self.payload(payload)
 
 
 def setup(bot):

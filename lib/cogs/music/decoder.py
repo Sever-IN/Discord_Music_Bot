@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from six.moves import range
 
 VK_STR = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN0PQRSTUVWXYZO123456789+/="
@@ -44,7 +43,7 @@ def decode_audio_url(string, user_id):
         elif cmd == 'i':
             tstr = vk_i(tstr, arg, user_id)
         else:
-            raise 'Unknown decode cmd: "{}"; Please send bugreport'.format(cmd)
+            print('error')
 
     return tstr
 

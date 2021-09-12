@@ -6,7 +6,7 @@ from lib.bot import MyBot
 #         self.session.run()
 
 if __name__ == '__main__':
-    tokens = open('./data/tokens/discord.0', 'r', encoding='utf-8')
+    tokens = open('./data/tokens/discord', 'r', encoding='utf-8')
     token = tokens.read().split('\n')[0]
     session = MyBot(token)
     session.run()

@@ -6,50 +6,145 @@ import re
 import urllib
 import codecs
 import sys
+from datetime import datetime
 from .jsinterp import JSInterpreter
+
+
+# class YouTubeStream:
+#     def __init__(self, main):
+#         self.main = main
+
+#         self.id = None
+#         self._url = None
+#         # self.data = None
+#         self.author = None
+#         # self.tags = None
+#         self.title = None
+#         # self.description = None
+#         # self.cover = None
+#         # self.duration = None
+#         # self.status = None
+#         # self.viev = None
+#         # self.like = None
+#         # self.dislike = None
+#         # self.comment = None
+#         self.codec = 'm3u8'
+
 
 
 class YouTubeTrack:
     def __init__(self, main):
         self.main = main
-
+        
+        self.kind = None
+        self.etag = None
         self.id = None
-        self._url = None
-        self.data = None
-        self.author = None
-        self.tags = None
+        self.date = None
+        self.channel = None
         self.title = None
         self.description = None
         self.cover = None
+        self.author = None
+        self.tags = None
+        self.live = None
+        self.language = None
         self.duration = None
+        self.stream = None
         self.status = None
-        self.viev = None
+        self.view = None
         self.like = None
         self.dislike = None
+        self.favorite = None
         self.comment = None
-        self.codec = 'opus'
+        self.start = None
+        self.end = None
+        self.schedule = None
+        self.active = None
+
+        self._url = None
+        self.codec = None
 
     @property
     def url(self):
-        if self._url is None:
-            self._url = self.main.get_audio(self.id)[0]
+        audios = self.main.get_audio(self.id)
+        if self._url is None and audios:
+            self._url, self.codec = self.main.get_audio(self.id)[0]
         return self._url
 
     def add(self, data={}):
 
-        self.id = data['id']
-        self.data = data['snippet'].get('publishedAt')
-        self.author = data['snippet'].get('channelTitle')
-        self.tags = data['snippet'].get('tags')
-        self.title = data['snippet'].get('title')
-        self.description = data['snippet'].get('description')
-        self.cover = data['snippet']['thumbnails'][list(data['snippet']['thumbnails'].keys())[-1]]['url']
-        self.duration = self._duration(data['contentDetails'].get('duration'))
-        self.status = data['status'].get('privacyStatus')
-        self.viev = data['statistics'].get('viewCount')
-        self.like = data['statistics'].get('likeCount')
-        self.dislike = data['statistics'].get('dislikeCount')
-        self.comment = data['statistics'].get('commentCount')
+        if 'kind' in data:
+            self.kind = data['kind']
+        if 'etag' in data:
+            self.etag = data['etag']
+        if 'id' in data:
+            self.id = data['id']
+        if 'snippet' in data:
+            snippet = data['snippet']
+            if 'publishedAt' in snippet:
+                self.date = datetime.strptime(snippet['publishedAt'],"%Y-%m-%dT%H:%M:%SZ")
+            if 'channelId' in snippet:
+                self.channel = snippet['channelId']
+            if 'title' in snippet:
+                self.title = snippet['title']
+            if 'description' in snippet:
+                self.description = snippet['description']
+            if 'thumbnails' in snippet:
+                thumbnails = snippet['thumbnails']
+                if 'maxres' in thumbnails:
+                    self.cover = thumbnails['maxres']['url']
+                elif 'standard' in thumbnails:
+                    self.cover = thumbnails['standard']['url']
+                elif 'high' in thumbnails:
+                    self.cover = thumbnails['high']['url']
+                elif 'medium' in thumbnails:
+                    self.cover = thumbnails['medium']['url']
+                elif 'default' in thumbnails:
+                    self.cover = thumbnails['default']['url']
+            if 'channelTitle' in snippet:
+                self.author = snippet['channelTitle']
+            if 'tags' in snippet:
+                self.tags = snippet['tags']
+            if 'liveBroadcastContent' in snippet:
+                self.live = True if snippet['liveBroadcastContent'] == 'live' else False
+            if 'defaultLanguage' in snippet:
+                self.language = snippet['defaultLanguage']
+            elif 'defaultAudioLanguage' in snippet:
+                self.language = snippet['defaultAudioLanguage']
+        if 'contentDetails' in data:
+            contentDetails = data['contentDetails']
+            if 'duration' in contentDetails:
+                self.duration = self._duration(contentDetails['duration'])
+        if 'status' in data:
+            status = data['status']
+            if 'uploadStatus' in status:
+                self.stream = True if status['uploadStatus'] == 'processed' else False
+            if 'privacyStatus' in status:
+                self.status = status['privacyStatus']
+        if 'statistics' in data:
+            statistics = data['statistics']
+            if 'viewCount' in statistics:
+                self.view = statistics['viewCount']
+            if 'likeCount' in statistics:
+                self.like = statistics['likeCount']
+            if 'dislikeCount' in statistics:
+                self.dislike = statistics['dislikeCount']
+            if 'favoriteCount' in statistics:
+                self.favorite = statistics['favoriteCount']
+            if 'commentCount' in statistics:
+                self.comment = statistics['commentCount']
+        if 'player' in data:
+            pass
+        if 'liveStreamingDetails' in data:
+            liveStreamingDetails = data['liveStreamingDetails']
+            if 'actualStartTime' in liveStreamingDetails:
+                self.start = datetime.strptime(liveStreamingDetails['actualStartTime'],"%Y-%m-%dT%H:%M:%SZ")
+            if 'actualEndTime' in liveStreamingDetails:
+                self.end = datetime.strptime(liveStreamingDetails['actualEndTime'],"%Y-%m-%dT%H:%M:%SZ")
+            if 'scheduledStartTime' in liveStreamingDetails:
+                self.schedule = datetime.strptime(liveStreamingDetails['scheduledStartTime'],"%Y-%m-%dT%H:%M:%SZ")
+            if 'concurrentViewers' in liveStreamingDetails:
+                self.active = liveStreamingDetails['concurrentViewers']
 
     def _duration(self, text):
         r = re.match(r'^P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$', text)
@@ -149,7 +244,7 @@ class YouTube:
         'embed': 'https://www.youtube.com/embed/%s',
     }
     RE_URL = re.compile(
-        r'^(?:https?://)?(?:www[.])?youtu(?:[.]be|be[.]com)/(?:playlist|(?:(?:watch[?]v=|v/)?(?P<track>[_\w-]+[^&])))[?&]?(?:list=(?P<album>[\w-]+[^&]))?'
+        r'^(?:https?://)?(?:www[.])?(?:music[.]|m[.])?youtu(?:[.]be|be[.]com|bekids[.]com)/(?:playlist|(?:(?:watch[?]v=|v/)?(?P<track>[_\w-]+[^=?&])))[?&]?(?:list=(?P<album>[\w-]+[^&]))?'
     )
     YT_INITIAL_PLAYER_RESPONSE_RE = r'ytInitialPlayerResponse\s*=\s*({.+?})\s*;'
     YT_INITIAL_BOUNDARY_RE = r'(?:var\s+meta|</script|\n)'
@@ -287,48 +382,50 @@ class YouTube:
 
     def get_audio(self, *ids):
         
-        def _parse_qsl(qs, keep_blank_values=False, strict_parsing=False,
-                       encoding='utf-8', errors='replace'):
+        # def _parse_qsl(qs, keep_blank_values=False, strict_parsing=False,
+        #                encoding='utf-8', errors='replace'):
 
-            pairs = [s2 for s1 in qs.split('&') for s2 in s1.split(';')]
-            r = []
-            for name_value in pairs:
-                if not name_value and not strict_parsing:
-                    continue
-                nv = name_value.split('=', 1)
-                if len(nv) != 2:
-                    if strict_parsing:
-                        raise ValueError('bad query field: %r' % (name_value,))
-                    # Handle case of a control-name with no equal sign
-                    if keep_blank_values:
-                        nv.append('')
-                    else:
-                        continue
-                if len(nv[1]) or keep_blank_values:
-                    name = nv[0].replace('+', ' ')
-                    name = urllib.parse.unquote(
-                        name, encoding=encoding, errors=errors)
-                    name = str(name)
-                    value = nv[1].replace('+', ' ')
-                    value = urllib.parse.unquote(
-                        value, encoding=encoding, errors=errors)
-                    value = str(value)
-                    r.append((name, value))
-            return r
+        #     pairs = [s2 for s1 in qs.split('&') for s2 in s1.split(';')]
+        #     r = []
+        #     for name_value in pairs:
+        #         if not name_value and not strict_parsing:
+        #             continue
+        #         nv = name_value.split('=', 1)
+        #         if len(nv) != 2:
+        #             if strict_parsing:
+        #                 raise ValueError('bad query field: %r' % (name_value,))
+        #             # Handle case of a control-name with no equal sign
+        #             if keep_blank_values:
+        #                 nv.append('')
+        #             else:
+        #                 continue
+        #         if len(nv[1]) or keep_blank_values:
+        #             name = nv[0].replace('+', ' ')
+        #             name = urllib.parse.unquote(
+        #                 name, encoding=encoding, errors=errors)
+        #             name = str(name)
+        #             value = nv[1].replace('+', ' ')
+        #             value = urllib.parse.unquote(
+        #                 value, encoding=encoding, errors=errors)
+        #             value = str(value)
+        #             r.append((name, value))
+        #     return r
 
-        def compat_parse_qs(qs, keep_blank_values=False, strict_parsing=False,
-                            encoding='utf-8', errors='replace'):
-            parsed_result = {}
-            pairs = _parse_qsl(qs, keep_blank_values, strict_parsing,
-                               encoding=encoding, errors=errors)
-            for name, value in pairs:
-                if name in parsed_result:
-                    parsed_result[name].append(value)
-                else:
-                    parsed_result[name] = [value]
-            return parsed_result
+        # def compat_parse_qs(qs, keep_blank_values=False, strict_parsing=False,
+        #                     encoding='utf-8', errors='replace'):
+        #     parsed_result = {}
+        #     pairs = _parse_qsl(qs, keep_blank_values, strict_parsing,
+        #                        encoding=encoding, errors=errors)
+        #     for name, value in pairs:
+        #         if name in parsed_result:
+        #             parsed_result[name].append(value)
+        #         else:
+        #             parsed_result[name] = [value]
+        #     return parsed_result
 
         audios = list()
+
+
 
         for i in ids:
             video_webpage = self.session.get(
@@ -343,65 +440,71 @@ class YouTube:
             ).text
 
             player_response = {}
-            video_info = {}
+            # video_info = {}
             embed_webpage = None
-            ytplayer_config = None
+            # ytplayer_config = None
 
-            if re.search(r'["\']status["\']\s*:\s*["\']LOGIN_REQUIRED', video_webpage) is not None:
-                age_gate = True
+            # if re.search(r'["\']status["\']\s*:\s*["\']LOGIN_REQUIRED', video_webpage) is not None:
+            #     print(1)
+            #     age_gate = True
 
-                embed_webpage = self.session.get(self.urls['embed'] % i).text
+            #     embed_webpage = self.session.get(self.urls['embed'] % i).text
 
-                video_info_webpage = self.session.get(
-                    self.urls['info'],
-                    params={
-                        'video_id': i,
-                        'eurl': 'https://youtube.googleapis.com/v/' + i,
-                        'sts': self._search_regex(r'"sts"\s*:\s*(\d+)', embed_webpage, default=''),
-                    }
-                ).text
+            #     video_info_webpage = self.session.get(
+            #         self.urls['info'],
+            #         params={
+            #             'video_id': i,
+            #             'eurl': 'https://youtube.googleapis.com/v/' + i,
+            #             'sts': self._search_regex(r'"sts"\s*:\s*(\d+)', embed_webpage, default=''),
+            #         }
+            #     ).text
 
-                if video_info_webpage:
+            #     if video_info_webpage:
 
-                    video_info = compat_parse_qs(video_info_webpage)
-                    pl_response = video_info.get('player_response', [None])[0]
-                    player_response = json.loads(pl_response)
+            #         video_info = compat_parse_qs(video_info_webpage)
+            #         pl_response = video_info.get('player_response', [None])[0]
+            #         player_response = json.loads(pl_response)
 
-            else:
-                age_gate = False
-                ytplayer_config = self._get_ytplayer_config(i, video_webpage)
-                if ytplayer_config:
-                    args = ytplayer_config['args']
-                    if args.get('url_encoded_fmt_stream_map') or args.get('hlsvp'):
+            # else:
+            #     print(2)
+            #     age_gate = False
+            #     ytplayer_config = self._get_ytplayer_config(i, video_webpage)
+            #     if ytplayer_config:
+            #         args = ytplayer_config['args']
+            #         if args.get('url_encoded_fmt_stream_map') or args.get('hlsvp'):
 
-                        video_info = dict((k, [v]) for k, v in args.items())
+            #             video_info = dict((k, [v]) for k, v in args.items())
 
-                    if not player_response:
-                        player_response = args.get('player_response')
+            #         if not player_response:
+            #             player_response = args.get('player_response')
 
-            if not video_info and not player_response:
-                player_response = json.loads(self._search_regex((r'%s\s*%s' % (self.YT_INITIAL_PLAYER_RESPONSE_RE, self.YT_INITIAL_BOUNDARY_RE), self.YT_INITIAL_PLAYER_RESPONSE_RE), video_webpage))
+            # if not video_info and not player_response:
+            #     print(3)
+            player_response = json.loads(self._search_regex((r'%s\s*%s' % (self.YT_INITIAL_PLAYER_RESPONSE_RE, self.YT_INITIAL_BOUNDARY_RE), self.YT_INITIAL_PLAYER_RESPONSE_RE), video_webpage))
+            # print(player_response.keys())
+            # if player_response['streamingData']:
+            if 'streamingData' in player_response:
+                if 'hlsManifestUrl' in player_response['streamingData']:
+                    if 'm3u8' in player_response['streamingData']['hlsManifestUrl']:
+                        url = player_response['streamingData']['hlsManifestUrl']
+                        audios.append((url, 'm3u8'))
+                        continue
 
-            streaming_formats = player_response.get('streamingData')['formats']
-            streaming_formats.extend(player_response.get('streamingData')['adaptiveFormats'] or [])
-
-            if streaming_formats:
-                for fmt in streaming_formats:
-                    if fmt.get('mimeType') == 'audio/webm; codecs="opus"' and fmt.get('audioQuality') == 'AUDIO_QUALITY_MEDIUM':
-                        if 'url' in fmt:
-                            cipher = None
-                            url = fmt.get('url')
-                        else:
-                            cipher = fmt.get('signatureCipher')
-                            url_data = urllib.parse.parse_qs(cipher)
-                            url = url_data.get('url')[0]
-
+                if 'adaptiveFormats' in player_response['streamingData']:
+                    format = player_response['streamingData']['adaptiveFormats'][-1]
+                    if 'url' in format:
+                        cipher = None
+                        url = format['url']
+                    elif 'signatureCipher' in format:
+                        cipher = format['signatureCipher']
+                        url_data = urllib.parse.parse_qs(cipher)
+                        url = url_data.get('url')[0]
                         if cipher:
                             if 's' in url_data:
-                                
+
                                 jsplayer_url_json = self._search_regex(self.ASSETS_RE, video_webpage)
 
-                                if not jsplayer_url_json and not age_gate:
+                                if not jsplayer_url_json:
                                     if embed_webpage is None:
                                         embed_webpage = self.session.get(self.urls['embed'] % i).text
                                     jsplayer_url_json = self._search_regex(self.ASSETS_RE, embed_webpage)
@@ -412,25 +515,20 @@ class YouTube:
                                     player_url = json.loads(player_url_json)
 
 
-                            if 'sig' in url_data:
-                                url += '&signature=' + url_data['sig'][0]
-                            elif 's' in url_data:
-                                encrypted_sig = url_data.get('s')[0]
-                                signature = self._decrypt_signature(encrypted_sig, i, player_url)
-                                sp = url_data.get('sp')[0] or 'signature'
-                                url += f'&{sp}={signature}'
+                        if 'sig' in url_data:
+                            url += '&signature=' + url_data['sig'][0]
+                        elif 's' in url_data:
+                            encrypted_sig = url_data.get('s')[0]
+                            signature = self._decrypt_signature(encrypted_sig, i, player_url)
+                            sp = url_data.get('sp')[0] or 'signature'
+                            url += f'&{sp}={signature}'
 
                         if 'ratebypass' not in url:
                             url += '&ratebypass=yes'
-                        break
-                    else:
-                        continue
-            audios.append(url)
+                    codec = format['mimeType'].split('"')[-2]
+                    audios.append((url, codec))
 
         return audios
-
-
-
 
 
     def get_track(self, *ids):
@@ -442,7 +540,7 @@ class YouTube:
         while True:
             params = {
                 'key': self.token,
-                'part': 'id,snippet,contentDetails,player,statistics,status',
+                'part': 'id,snippet,contentDetails,status,statistics,player,liveStreamingDetails',
                 'id': ','.join(ids),
                 'maxResults': 999,
             }
@@ -541,11 +639,12 @@ class YouTube:
                 ids = [i['id']['videoId'] for i in response['items']]
                 tracks.extend(self.get_track(*ids))
 
-        return {'albums': albums, 'tracks': tracks}
+        return {'albums': albums, 'tracks': tracks, 'count': sum([album.count for album in albums])+len(tracks)}
 
-# url = 'https://www.youtube.com/watch?v=w_mw69OhQd8'
+# url = 'https://www.youtube.com/watch?v=5qap5aO4i9A'
 
 # yt = YouTube()
-# a = yt.get_item(url)
-# print(a)
+# a = yt.get_item('https://www.youtube.com/watch?v=QzEPz3na3Yg')
+# print(a.url)
+# print(a.codec)
 # s = yt.search(string='porter robinson', options={'album': 1, 'track': 1})

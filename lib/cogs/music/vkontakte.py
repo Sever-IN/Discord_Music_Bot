@@ -27,7 +27,7 @@ class VkontakteTrack:
         self.cover = None
         self.duration = None
 
-        self.codec = 'mp3'
+        self.codec = 'm3u8'
 
     @property
     def url(self):
@@ -116,11 +116,11 @@ class Vkontakte:
         
         session = requests.Session()
         if os.path.isfile('cookies'):
-            if reboot == False:
+            if reboot:
+                os.remove('cookies')
+            else:
                 with open('cookies', 'rb') as f:
                     session.cookies.update(pickle.load(f))
-            else:
-                os.remove('cookies')
         
         if not os.path.isfile('cookies'):
             login, password = self.token.split("\n")
@@ -136,7 +136,6 @@ class Vkontakte:
                 'lg_h': re.search(r'lg_h=(?P<lg_h>[a-z0-9]+)', response.text).groups()[0]
             }
             res = session.post('https://login.vk.com/', params)
-            # print(res.text)
             while 'onLoginReCaptcha' in res.text:
                 self.sid = str(random.random())[2:16]
                 self.key = input(f'\nhttps://api.vk.com/captcha.php?sid={self.sid}\nEnter captcha code: ')
@@ -209,6 +208,7 @@ class Vkontakte:
                     )
                     if request.text:
                         response = request.json()
+                        # print(response)
 
                         for audio in response['data'][0]:
                             len(audio)
@@ -217,8 +217,9 @@ class Vkontakte:
                             if 'audio_api_unavailable' in url:
                                 url = decode_audio_url(url, self.user)
 
-                            if 'm3u8' in url:
-                                url = self.RE_M3U8_TO_MP3.sub(r'\1/\2.mp3', url)
+                            # if 'm3u8' in url:
+                            #     url = self.RE_M3U8_TO_MP3.sub(r'\1/\2.mp3', url)
+                            # print(url)
 
                             audios.append(url)
                         break
@@ -349,14 +350,15 @@ class Vkontakte:
                 break
             break
 
-        return {'albums': albums, 'tracks': tracks}
+        return {'albums': albums, 'tracks': tracks, 'count': sum([album.count for album in albums])+len(tracks)}
 
-# url = 'https://m.vk.com/audios211315708'
+# url = 'https://m.vk.com/audio?act=audio_playlist-2000180672_11180672&from=my_playlists&access_hash=ed6d6257d72fd1766f&back_url=%2Faudios211315708%3Fsection%3Dmy&back_hash=e027be0db402d41165&ref=PUlQVA8GR0R3W0tMF2tYRGpJUVQPBlpXdVpcQQUMR0RzSVNUWE1JSmRfS0wEGElXc0lTRxkWWVBkUVtHBAdaU3FbUQs'
 
 # vk = Vkontakte()
 # a = vk.get_item(url)
-# print(a.tracks)
-# vk.search(string='porter robinson', options={'album': 5, 'track': 30})
+# print([t.title for t in a.tracks])
+# s = vk.search(string='porter robinson', options={'album': 1, 'track': 4})
+# print(s)
 # vk.search(string='flicker', options={'album': 3, 'track': 3})
 # vk.search(string='hidden cirizen', options={'album': 7, 'track': 3})
 # vk.search(string='time to wake up', options={'album': 10, 'track': 3})

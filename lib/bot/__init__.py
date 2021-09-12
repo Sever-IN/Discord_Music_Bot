@@ -26,7 +26,7 @@ class MyBot(commands.Bot):
     def run(self):
         self.setup()
 
-        with open("data/tokens/discord.0", "r", encoding="utf-8") as f:
+        with open("data/tokens/discord", "r", encoding="utf-8") as f:
             TOKEN = f.read().split('\n')[0]
 
         print("Running bot...")
@@ -37,10 +37,6 @@ class MyBot(commands.Bot):
         await super().close()
 
     async def close(self):
-        # channel = self.get_channel(806929965635469352)
-        # messages = await channel.history().flatten()
-        # await channel.delete_messages(messages)
-
         print("Closing on keyboard interrupt...")
         await self.shutdown()
 
@@ -53,21 +49,18 @@ class MyBot(commands.Bot):
     async def on_disconnect(self):
         print("Bot disconnected.")
 
-    async def on_error(self, err, *args, **kwargs):
-        channel = self.get_channel(782997793001177099)
-        print(datetime.datetime.now())
-        await channel.send(err)
-        await channel.send(str(args))
-        await channel.send(str(kwargs))
+    # async def on_error(self, err, *args, **kwargs):
+    #     stdout = self.get_channel(782997793001177099)
+    #     print(datetime.datetime.now())
+    #     await stdout.send(err)
+    #     await stdout.send(str(args))
+    #     await stdout.send(str(kwargs))
 
-    async def on_command_error(self, ctx, exc):
-        raise getattr(exc, "original", exc)
+    # async def on_command_error(self, ctx, exc):
+    #     pass
+    #     # raise getattr(exc, "original", exc)
 
     async def on_ready(self):
-        # channel = self.get_channel(806929965635469352)
-        # messages = await channel.history().flatten()
-        # await channel.delete_messages(messages)
-        
         self.client_id = (await self.application_info()).id
         print("Bot ready.")
 
